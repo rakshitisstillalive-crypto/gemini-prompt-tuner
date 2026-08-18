@@ -282,7 +282,37 @@ export function ReportView({
   );
 }
 
+const MAX_EDGE = 1280;
+
+/** Downscales + re-encodes an image data URL so the upload stays small and fast. */
+async function downscaleDataUrl(dataUrl: string): Promise<string> {
+  if (typeof document === "undefined") return dataUrl;
+  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("decode failed"));
+    img.src = dataUrl;
+  });
+
+  const scale = Math.min(1, MAX_EDGE / Math.max(image.width, image.height));
+  const width = Math.max(1, Math.round(image.width * scale));
+  const height = Math.max(1, Math.round(image.height * scale));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return dataUrl;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, width, height);
+  ctx.drawImage(image, 0, 0, width, height);
+
+  const encoded = canvas.toDataURL("image/jpeg", 0.85);
+  return encoded.length < dataUrl.length ? encoded : dataUrl;
+}
+
 export function Analyzer() {
+
   const [imageDataUrl, setImageDataUrl] = useState<string | null>(null);
   const [note, setNote] = useState("");
   const [loading, setLoading] = useState(false);
@@ -300,13 +330,21 @@ export function Analyzer() {
       return;
     }
     const reader = new FileReader();
-    reader.onload = () => {
-      setImageDataUrl(String(reader.result));
+    reader.onload = async () => {
+      const original = String(reader.result);
+      let optimised = original;
+      try {
+        optimised = await downscaleDataUrl(original);
+      } catch {
+        // keep the original if the browser cannot re-encode it
+      }
+      setImageDataUrl(optimised);
       setReport(null);
       setLastError(null);
     };
     reader.readAsDataURL(file);
   }, []);
+
 
   const run = async () => {
     if (!imageDataUrl) return;
