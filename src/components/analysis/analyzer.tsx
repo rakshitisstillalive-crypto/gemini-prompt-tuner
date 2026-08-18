@@ -300,13 +300,21 @@ export function Analyzer() {
       return;
     }
     const reader = new FileReader();
-    reader.onload = () => {
-      setImageDataUrl(String(reader.result));
+    reader.onload = async () => {
+      const original = String(reader.result);
+      let optimised = original;
+      try {
+        optimised = await downscaleDataUrl(original);
+      } catch {
+        // keep the original if the browser cannot re-encode it
+      }
+      setImageDataUrl(optimised);
       setReport(null);
       setLastError(null);
     };
     reader.readAsDataURL(file);
   }, []);
+
 
   const run = async () => {
     if (!imageDataUrl) return;
