@@ -9,6 +9,8 @@ const GEMINI_MODELS = [
   process.env["GEMINI_MODEL"]?.trim(),
   "gemini-flash-latest",
   "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-2.5-flash-lite",
 ].filter(Boolean) as string[];
 
 const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
