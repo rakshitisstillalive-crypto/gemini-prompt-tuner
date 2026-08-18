@@ -95,22 +95,123 @@ async function callGeminiModel(
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Direct Google Gemini API call (used when hosting outside Lovable, e.g. Netlify). */
-async function analyzeWithGeminiKey(
-  rawKey: string,
+/** A generic OpenAI-compatible vision provider. */
+type Provider = {
+  name: string;
+  url: string;
+  apiKey: string;
+  models: string[];
+  headers: Record<string, string>;
+};
+
+/** Builds the ordered provider chain from whichever API keys are configured. */
+function buildProviders(): Provider[] {
+  const providers: Provider[] = [];
+  const env = (name: string) => process.env[name]?.trim();
+
+  const geminiKey = env("GEMINI_API_KEY");
+  if (geminiKey) {
+    providers.push({
+      name: "Gemini",
+      url: GEMINI_URL,
+      apiKey: geminiKey,
+      models: GEMINI_MODELS,
+      headers: { Authorization: `Bearer ${geminiKey}` },
+    });
+  }
+
+  const openaiKey = env("OPENAI_API_KEY");
+  if (openaiKey) {
+    providers.push({
+      name: "OpenAI",
+      url: "https://api.openai.com/v1/chat/completions",
+      apiKey: openaiKey,
+      models: [env("OPENAI_MODEL"), "gpt-4o-mini", "gpt-4o"].filter(Boolean) as string[],
+      headers: { Authorization: `Bearer ${openaiKey}` },
+    });
+  }
+
+  const openrouterKey = env("OPENROUTER_API_KEY");
+  if (openrouterKey) {
+    providers.push({
+      name: "OpenRouter",
+      url: "https://openrouter.ai/api/v1/chat/completions",
+      apiKey: openrouterKey,
+      models: [
+        env("OPENROUTER_MODEL"),
+        "google/gemini-2.0-flash-001",
+        "anthropic/claude-3.5-sonnet",
+      ].filter(Boolean) as string[],
+      headers: { Authorization: `Bearer ${openrouterKey}` },
+    });
+  }
+
+  const groqKey = env("GROQ_API_KEY");
+  if (groqKey) {
+    providers.push({
+      name: "Groq",
+      url: "https://api.groq.com/openai/v1/chat/completions",
+      apiKey: groqKey,
+      models: [env("GROQ_MODEL"), "meta-llama/llama-4-scout-17b-16e-instruct"].filter(
+        Boolean,
+      ) as string[],
+      headers: { Authorization: `Bearer ${groqKey}` },
+    });
+  }
+
+  const lovableKey = env("LOVABLE_API_KEY");
+  if (lovableKey) {
+    providers.push({
+      name: "Lovable AI",
+      url: GATEWAY_URL,
+      apiKey: lovableKey,
+      models: [GATEWAY_MODEL],
+      headers: { "Lovable-API-Key": lovableKey },
+    });
+  }
+
+  return providers;
+}
+
+async function callModel(
+  provider: Provider,
+  model: string,
   imageDataUrl: string,
   note?: string,
-): Promise<AnalysisReport> {
-  const apiKey = rawKey.trim();
+) {
+  return fetch(provider.url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...provider.headers,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.4,
+      response_format: { type: "json_object" },
+      messages: buildMessages(imageDataUrl, note),
+    }),
+  });
+}
+
+type ProviderOutcome =
+  | { ok: true; report: AnalysisReport }
+  | { ok: false; message: string; status: number; fatal: boolean };
+
+/** Tries every model of one provider, with backoff on transient failures. */
+async function runProvider(
+  provider: Provider,
+  imageDataUrl: string,
+  note?: string,
+): Promise<ProviderOutcome> {
   let lastMessage = "";
   let lastStatus = 502;
 
-  for (const model of GEMINI_MODELS) {
-    // Overloaded / transient upstream failures: retry the same model a few times.
+  for (const model of provider.models) {
     for (let attempt = 0; attempt < 3; attempt++) {
       let response: Response;
       try {
-        response = await callGeminiModel(model, apiKey, imageDataUrl, note);
+        response = await callModel(provider, model, imageDataUrl, note);
       } catch (networkError) {
         lastMessage = networkError instanceof Error ? networkError.message : "Network error";
         lastStatus = 503;
@@ -123,8 +224,19 @@ async function analyzeWithGeminiKey(
           choices?: { message?: { content?: string } }[];
         };
         const raw = payload.choices?.[0]?.message?.content ?? "";
-        if (!raw) throw new AnalysisError("The analysis engine returned an empty report.", 502);
-        return extractReport(raw);
+        if (!raw) {
+          lastMessage = "The analysis engine returned an empty report.";
+          lastStatus = 502;
+          break;
+        }
+        try {
+          return { ok: true, report: extractReport(raw) };
+        } catch (parseError) {
+          lastMessage =
+            parseError instanceof Error ? parseError.message : "Unreadable report returned.";
+          lastStatus = 502;
+          break;
+        }
       }
 
       const body = await response.text();
@@ -135,11 +247,11 @@ async function analyzeWithGeminiKey(
       } catch {
         providerMessage = body.slice(0, 300);
       }
-      console.error("Gemini error", model, response.status, providerMessage);
+      console.error(`${provider.name} error`, model, response.status, providerMessage);
       lastMessage = providerMessage;
       lastStatus = response.status;
 
-      // Model not available for this key/project -> try the next candidate.
+      // Model unavailable for this key -> next model of the same provider.
       const modelProblem =
         response.status === 404 ||
         /does not exist|do not have access|not found|unsupported model|deprecated|not supported/i.test(
@@ -147,20 +259,34 @@ async function analyzeWithGeminiKey(
         );
       if (modelProblem) break;
 
+      // Bad key or blocked -> this provider is out; the chain continues elsewhere.
       if (response.status === 401 || response.status === 403) {
-        throw new AnalysisError(
-          providerMessage || "The configured GEMINI_API_KEY was rejected by Google.",
-          403,
-        );
+        return {
+          ok: false,
+          status: 403,
+          fatal: false,
+          message: providerMessage || `${provider.name} rejected the configured API key.`,
+        };
       }
       if (response.status === 400) {
-        throw new AnalysisError(
-          providerMessage || "Gemini rejected the request. Check the image size and format.",
-          400,
-        );
+        // The request itself is wrong — no other provider will accept it either.
+        return {
+          ok: false,
+          status: 400,
+          fatal: true,
+          message:
+            providerMessage || "The request was rejected. Check the image size and format.",
+        };
+      }
+      if (response.status === 402) {
+        return {
+          ok: false,
+          status: 402,
+          fatal: false,
+          message: providerMessage || `${provider.name} credits are exhausted.`,
+        };
       }
       if (response.status === 429 || response.status >= 500) {
-        // Transient: back off, retry, then fall through to the next model.
         await sleep(800 * (attempt + 1));
         continue;
       }
@@ -168,27 +294,16 @@ async function analyzeWithGeminiKey(
     }
   }
 
-  if (lastStatus === 429) {
-    throw new AnalysisError(
-      lastMessage || "Gemini is rate limited or out of quota — please try again shortly.",
-      429,
-    );
-  }
-  throw new AnalysisError(
-    lastMessage || "No supported Gemini vision model is available for this API key.",
-    lastStatus >= 500 ? 503 : 502,
-  );
+  return { ok: false, status: lastStatus, fatal: false, message: lastMessage };
 }
 
-
-/** Runs the vision analysis and returns a structured report. */
+/** Runs the vision analysis across every configured provider, in order. */
 export async function analyzeWithGemini(input: AnalyzeRequest): Promise<AnalysisReport> {
-  const geminiKey = process.env["GEMINI_API_KEY"]?.trim();
-  const lovableKey = process.env["LOVABLE_API_KEY"]?.trim();
+  const providers = buildProviders();
 
-  if (!geminiKey && !lovableKey) {
+  if (providers.length === 0) {
     throw new AnalysisError(
-      "AI is not configured. Add GEMINI_API_KEY in Netlify → Site settings → Environment variables, then redeploy.",
+      "AI is not configured. Add GEMINI_API_KEY (or OPENAI_API_KEY / OPENROUTER_API_KEY / GROQ_API_KEY) in your host's environment variables, then redeploy.",
       500,
     );
   }
@@ -199,47 +314,32 @@ export async function analyzeWithGemini(input: AnalyzeRequest): Promise<Analysis
   assertDataUrl(input.imageDataUrl);
   const note = typeof input.note === "string" ? input.note.slice(0, 500) : undefined;
 
-  // Your own Gemini key takes priority — this is what runs on Netlify.
-  if (geminiKey) {
-    try {
-      return await analyzeWithGeminiKey(geminiKey, input.imageDataUrl, note);
-    } catch (error) {
-      const status = error instanceof AnalysisError ? error.status : 500;
-      // Only fall back to the Lovable gateway for transient/unavailable failures.
-      if (!lovableKey || (status !== 429 && status !== 502 && status !== 503)) throw error;
-      console.error("Falling back to Lovable AI gateway after Gemini failure");
-    }
+  let lastMessage = "";
+  let lastStatus = 502;
+
+  for (const provider of providers) {
+    const outcome = await runProvider(provider, input.imageDataUrl, note);
+    if (outcome.ok) return outcome.report;
+
+    if (outcome.fatal) throw new AnalysisError(outcome.message, outcome.status);
+
+    lastMessage = outcome.message ? `${provider.name}: ${outcome.message}` : lastMessage;
+    lastStatus = outcome.status;
+    console.error(`Falling back from ${provider.name}`);
   }
 
-
-  const response = await fetch(GATEWAY_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Lovable-API-Key": lovableKey!,
-    },
-    body: JSON.stringify({
-      model: GATEWAY_MODEL,
-      temperature: 0.4,
-      response_format: { type: "json_object" },
-      messages: buildMessages(input.imageDataUrl, note),
-    }),
-  });
-
-  if (response.status === 429) {
-    throw new AnalysisError("Too many requests — please try again shortly.", 429);
+  if (lastStatus === 429) {
+    throw new AnalysisError(
+      lastMessage || "All AI providers are rate limited — please try again shortly.",
+      429,
+    );
   }
-  if (response.status === 402) {
-    throw new AnalysisError("AI credits are exhausted. Please top up to continue.", 402);
+  if (lastStatus === 402) {
+    throw new AnalysisError(lastMessage || "AI credits are exhausted. Please top up.", 402);
   }
-  if (!response.ok) {
-    const body = await response.text();
-    console.error("AI gateway error", response.status, body);
-    throw new AnalysisError("The analysis engine could not process this image.", 502);
-  }
-
-  const payload = (await response.json()) as { choices?: { message?: { content?: string } }[] };
-  const raw = payload.choices?.[0]?.message?.content ?? "";
-  if (!raw) throw new AnalysisError("The analysis engine returned an empty report.", 502);
-  return extractReport(raw);
+  throw new AnalysisError(
+    lastMessage || "No configured AI provider could analyse this image.",
+    lastStatus >= 500 ? 503 : 502,
+  );
 }
+
