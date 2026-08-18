@@ -2,18 +2,18 @@ import type { AnalysisReport } from "@/lib/analysis-types";
 import { SYSTEM_PROMPT } from "@/lib/analysis-prompt";
 
 /**
- * OpenAI vision models, tried in order. Override with the OPENAI_MODEL env var.
+ * Gemini vision models, tried in order. Override with the GEMINI_MODEL env var.
  * If one is unavailable for the key, the next is tried automatically.
  */
-const OPENAI_MODELS = [
-  process.env["OPENAI_MODEL"]?.trim(),
-  "gpt-4o-mini",
-  "gpt-4o",
+const GEMINI_MODELS = [
+  process.env["GEMINI_MODEL"]?.trim(),
+  "gemini-flash-latest",
+  "gemini-2.5-flash",
 ].filter(Boolean) as string[];
 
-const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
+const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
-const GATEWAY_MODEL = "google/gemini-2.5-flash";
+const GATEWAY_MODEL = "google/gemini-3.7-flash";
 const GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 
 export type AnalyzeRequest = { imageDataUrl: string; note?: string | undefined };
@@ -69,14 +69,14 @@ function buildMessages(imageDataUrl: string, note?: string) {
   ];
 }
 
-/** One attempt against a specific OpenAI model. */
-async function callOpenAiModel(
+/** One attempt against a specific Gemini model. */
+async function callGeminiModel(
   model: string,
   apiKey: string,
   imageDataUrl: string,
   note?: string,
 ) {
-  return fetch(OPENAI_URL, {
+  return fetch(GEMINI_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -91,8 +91,8 @@ async function callOpenAiModel(
   });
 }
 
-/** Direct OpenAI API call (used when hosting outside Lovable, e.g. Netlify). */
-async function analyzeWithOpenAiKey(
+/** Direct Google Gemini API call (used when hosting outside Lovable, e.g. Netlify). */
+async function analyzeWithGeminiKey(
   rawKey: string,
   imageDataUrl: string,
   note?: string,
@@ -101,8 +101,8 @@ async function analyzeWithOpenAiKey(
   let lastMessage = "";
   let lastStatus = 502;
 
-  for (const model of OPENAI_MODELS) {
-    const response = await callOpenAiModel(model, apiKey, imageDataUrl, note);
+  for (const model of GEMINI_MODELS) {
+    const response = await callGeminiModel(model, apiKey, imageDataUrl, note);
 
     if (response.ok) {
       const payload = (await response.json()) as {
@@ -120,7 +120,7 @@ async function analyzeWithOpenAiKey(
     } catch {
       providerMessage = body.slice(0, 300);
     }
-    console.error("OpenAI error", model, response.status, providerMessage);
+    console.error("Gemini error", model, response.status, providerMessage);
     lastMessage = providerMessage;
     lastStatus = response.status;
 
@@ -138,36 +138,36 @@ async function analyzeWithOpenAiKey(
     }
     if (response.status === 401 || response.status === 403) {
       throw new AnalysisError(
-        providerMessage || "The configured OPENAI_API_KEY was rejected by OpenAI.",
+        providerMessage || "The configured GEMINI_API_KEY was rejected by Google.",
         403,
       );
     }
     if (response.status === 400) {
       throw new AnalysisError(
-        providerMessage || "OpenAI rejected the request. Check the image size and format.",
+        providerMessage || "Gemini rejected the request. Check the image size and format.",
         400,
       );
     }
     throw new AnalysisError(
-      providerMessage || "OpenAI's service is temporarily unavailable.",
+      providerMessage || "Gemini's service is temporarily unavailable.",
       response.status >= 500 ? 503 : 502,
     );
   }
 
   throw new AnalysisError(
-    lastMessage || "No supported OpenAI vision model is available for this API key.",
+    lastMessage || "No supported Gemini vision model is available for this API key.",
     lastStatus >= 500 ? 503 : 502,
   );
 }
 
 /** Runs the vision analysis and returns a structured report. */
 export async function analyzeWithGemini(input: AnalyzeRequest): Promise<AnalysisReport> {
-  const openAiKey = process.env["OPENAI_API_KEY"]?.trim();
+  const geminiKey = process.env["GEMINI_API_KEY"]?.trim();
   const lovableKey = process.env["LOVABLE_API_KEY"]?.trim();
 
-  if (!openAiKey && !lovableKey) {
+  if (!geminiKey && !lovableKey) {
     throw new AnalysisError(
-      "AI is not configured. Add OPENAI_API_KEY in Netlify → Site settings → Environment variables, then redeploy.",
+      "AI is not configured. Add GEMINI_API_KEY in Netlify → Site settings → Environment variables, then redeploy.",
       500,
     );
   }
@@ -178,9 +178,9 @@ export async function analyzeWithGemini(input: AnalyzeRequest): Promise<Analysis
   assertDataUrl(input.imageDataUrl);
   const note = typeof input.note === "string" ? input.note.slice(0, 500) : undefined;
 
-  // Your own OpenAI key takes priority — this is what runs on Netlify.
-  if (openAiKey) {
-    return analyzeWithOpenAiKey(openAiKey, input.imageDataUrl, note);
+  // Your own Gemini key takes priority — this is what runs on Netlify.
+  if (geminiKey) {
+    return analyzeWithGeminiKey(geminiKey, input.imageDataUrl, note);
   }
 
   const response = await fetch(GATEWAY_URL, {
