@@ -93,6 +93,8 @@ async function callGeminiModel(
   });
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 /** Direct Google Gemini API call (used when hosting outside Lovable, e.g. Netlify). */
 async function analyzeWithGeminiKey(
   rawKey: string,
@@ -104,63 +106,80 @@ async function analyzeWithGeminiKey(
   let lastStatus = 502;
 
   for (const model of GEMINI_MODELS) {
-    const response = await callGeminiModel(model, apiKey, imageDataUrl, note);
+    // Overloaded / transient upstream failures: retry the same model a few times.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let response: Response;
+      try {
+        response = await callGeminiModel(model, apiKey, imageDataUrl, note);
+      } catch (networkError) {
+        lastMessage = networkError instanceof Error ? networkError.message : "Network error";
+        lastStatus = 503;
+        await sleep(600 * (attempt + 1));
+        continue;
+      }
 
-    if (response.ok) {
-      const payload = (await response.json()) as {
-        choices?: { message?: { content?: string } }[];
-      };
-      const raw = payload.choices?.[0]?.message?.content ?? "";
-      if (!raw) throw new AnalysisError("The analysis engine returned an empty report.", 502);
-      return extractReport(raw);
-    }
+      if (response.ok) {
+        const payload = (await response.json()) as {
+          choices?: { message?: { content?: string } }[];
+        };
+        const raw = payload.choices?.[0]?.message?.content ?? "";
+        if (!raw) throw new AnalysisError("The analysis engine returned an empty report.", 502);
+        return extractReport(raw);
+      }
 
-    const body = await response.text();
-    let providerMessage = "";
-    try {
-      providerMessage = (JSON.parse(body) as { error?: { message?: string } }).error?.message?.trim() ?? "";
-    } catch {
-      providerMessage = body.slice(0, 300);
-    }
-    console.error("Gemini error", model, response.status, providerMessage);
-    lastMessage = providerMessage;
-    lastStatus = response.status;
+      const body = await response.text();
+      let providerMessage = "";
+      try {
+        providerMessage =
+          (JSON.parse(body) as { error?: { message?: string } }).error?.message?.trim() ?? "";
+      } catch {
+        providerMessage = body.slice(0, 300);
+      }
+      console.error("Gemini error", model, response.status, providerMessage);
+      lastMessage = providerMessage;
+      lastStatus = response.status;
 
-    // Model not available for this key/project -> try the next candidate.
-    const modelProblem =
-      response.status === 404 ||
-      /does not exist|do not have access|not found|unsupported model|deprecated/i.test(providerMessage);
-    if (modelProblem) continue;
+      // Model not available for this key/project -> try the next candidate.
+      const modelProblem =
+        response.status === 404 ||
+        /does not exist|do not have access|not found|unsupported model|deprecated|not supported/i.test(
+          providerMessage,
+        );
+      if (modelProblem) break;
 
-    if (response.status === 429) {
-      throw new AnalysisError(
-        providerMessage || "Too many requests or quota exceeded — please try again shortly.",
-        429,
-      );
+      if (response.status === 401 || response.status === 403) {
+        throw new AnalysisError(
+          providerMessage || "The configured GEMINI_API_KEY was rejected by Google.",
+          403,
+        );
+      }
+      if (response.status === 400) {
+        throw new AnalysisError(
+          providerMessage || "Gemini rejected the request. Check the image size and format.",
+          400,
+        );
+      }
+      if (response.status === 429 || response.status >= 500) {
+        // Transient: back off, retry, then fall through to the next model.
+        await sleep(800 * (attempt + 1));
+        continue;
+      }
+      break;
     }
-    if (response.status === 401 || response.status === 403) {
-      throw new AnalysisError(
-        providerMessage || "The configured GEMINI_API_KEY was rejected by Google.",
-        403,
-      );
-    }
-    if (response.status === 400) {
-      throw new AnalysisError(
-        providerMessage || "Gemini rejected the request. Check the image size and format.",
-        400,
-      );
-    }
-    throw new AnalysisError(
-      providerMessage || "Gemini's service is temporarily unavailable.",
-      response.status >= 500 ? 503 : 502,
-    );
   }
 
+  if (lastStatus === 429) {
+    throw new AnalysisError(
+      lastMessage || "Gemini is rate limited or out of quota — please try again shortly.",
+      429,
+    );
+  }
   throw new AnalysisError(
     lastMessage || "No supported Gemini vision model is available for this API key.",
     lastStatus >= 500 ? 503 : 502,
   );
 }
+
 
 /** Runs the vision analysis and returns a structured report. */
 export async function analyzeWithGemini(input: AnalyzeRequest): Promise<AnalysisReport> {
