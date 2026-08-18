@@ -201,8 +201,16 @@ export async function analyzeWithGemini(input: AnalyzeRequest): Promise<Analysis
 
   // Your own Gemini key takes priority — this is what runs on Netlify.
   if (geminiKey) {
-    return analyzeWithGeminiKey(geminiKey, input.imageDataUrl, note);
+    try {
+      return await analyzeWithGeminiKey(geminiKey, input.imageDataUrl, note);
+    } catch (error) {
+      const status = error instanceof AnalysisError ? error.status : 500;
+      // Only fall back to the Lovable gateway for transient/unavailable failures.
+      if (!lovableKey || (status !== 429 && status !== 502 && status !== 503)) throw error;
+      console.error("Falling back to Lovable AI gateway after Gemini failure");
+    }
   }
+
 
   const response = await fetch(GATEWAY_URL, {
     method: "POST",
