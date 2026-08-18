@@ -71,27 +71,6 @@ function buildMessages(imageDataUrl: string, note?: string) {
   ];
 }
 
-/** One attempt against a specific Gemini model. */
-async function callGeminiModel(
-  model: string,
-  apiKey: string,
-  imageDataUrl: string,
-  note?: string,
-) {
-  return fetch(GEMINI_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.4,
-      response_format: { type: "json_object" },
-      messages: buildMessages(imageDataUrl, note),
-    }),
-  });
-}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
